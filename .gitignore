@@ -1,0 +1,27 @@
+# --- Python build artifacts ---
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- VS Code ---
+.vscode/
+*.code-workspace
+
+# --- macOS junk ---
+.DS_Store
+
+# --- Logs & temp ---
+*.log
+*.tmp
