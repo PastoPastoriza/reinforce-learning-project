@@ -19,7 +19,9 @@ def get_data():
   # 0 = AAPL
   # 1 = MSI
   # 2 = SBUX
-  df = pd.read_csv('../aapl_msi_sbux.csv')
+  # Reemplazá la línea del read_csv por estas dos líneas:
+  data_path = os.path.join(os.path.dirname(__file__), 'aapl_msi_sbux.csv')
+  df = pd.read_csv(data_path)
   return df.values
 
 
@@ -269,9 +271,13 @@ class DQNAgent(object):
 
   def train(self, state, action, reward, next_state, done):
     if done:
-      target = reward
+      # target = reward
+      target = float(reward)
     else:
-      target = reward + self.gamma * np.amax(self.model.predict(next_state), axis=1)
+      # target = reward + self.gamma * np.amax(self.model.predict(next_state), axis=1)
+      q_next = self.model.predict(next_state)[0]  # (n_action,)
+      target = float(reward + self.gamma * np.max(q_next))
+
 
     target_full = self.model.predict(state)
     target_full[0, action] = target
@@ -314,7 +320,7 @@ if __name__ == '__main__':
   # config
   models_folder = 'linear_rl_trader_models'
   rewards_folder = 'linear_rl_trader_rewards'
-  num_episodes = 2000
+  num_episodes = 100
   batch_size = 32
   initial_investment = 20000
 
