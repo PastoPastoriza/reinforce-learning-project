@@ -19,7 +19,7 @@ def get_data():
   # 0 = AAPL
   # 1 = MSI
   # 2 = SBUX
-  df = pd.read_csv('../tf2.0/aapl_msi_sbux.csv')
+  df = pd.read_csv('../aapl_msi_sbux.csv')
   return df.values
 
 
