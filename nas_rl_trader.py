@@ -35,6 +35,11 @@ def maybe_make_dir(directory: str) -> None:
 def load_and_process(csv_path: str, atr_period: int, sma_period: int):
     """Load NASDAQ data, resample to 1H and compute features.
 
+    The feature set is intentionally narrow so the agent only observes
+    information believed to be predictive.  The DataFrame returned keeps the
+    original OHLC columns for inspection, but the ``features`` DataFrame only
+    contains the engineered signals listed below.
+
     Parameters
     ----------
     csv_path : str
@@ -46,10 +51,10 @@ def load_and_process(csv_path: str, atr_period: int, sma_period: int):
 
     Returns
     -------
-    pd.DataFrame
-        DataFrame indexed by timestamp with BidClose/AskClose and features.
+    Tuple[pd.DataFrame, pd.DataFrame]
+        Full DataFrame and feature subset used for the model.
     """
-    # 1) Read CSV and adjust timestamps
+    # 1) Read CSV and adjust timestamps (UTC-3 -> UTC)
     df = pd.read_csv(csv_path, parse_dates=["Date"])
     df["Date"] = df["Date"] - pd.Timedelta(hours=3)
     df = df.sort_values("Date").set_index("Date")
@@ -71,15 +76,16 @@ def load_and_process(csv_path: str, atr_period: int, sma_period: int):
     # 3) Indicators on BID prices
     high = df["BidHigh"]
     low = df["BidLow"]
+    open_ = df["BidOpen"]
     close = df["BidClose"]
 
-    # True range components
+    # True range components -> ATR
     prev_close = close.shift(1)
     tr = pd.concat(
         [
-            high - low,
-            (high - prev_close).abs(),
-            (prev_close - low).abs(),
+            high - low,  # high-low
+            (high - prev_close).abs(),  # |high-prev_close|
+            (prev_close - low).abs(),  # |prev_close-low|
         ],
         axis=1,
     ).max(axis=1)
@@ -87,17 +93,59 @@ def load_and_process(csv_path: str, atr_period: int, sma_period: int):
 
     sma = close.rolling(window=sma_period).mean()
 
-    log_return = np.log(close / close.shift(1))
+    # --- Feature engineering -------------------------------------------------
+    log_return_close = np.log(close / close.shift(1))  # ln(C_t / C_{t-1})
+    log_return_high = np.log(high / high.shift(1))  # ln(H_t / H_{t-1})
+    log_return_low = np.log(low / low.shift(1))  # ln(L_t / L_{t-1})
+    candle_direction = (close > open_).astype(float)  # 1 if green else 0
+    atr_pct = atr / close  # ATR_t / Close_t
+    sma_gradient = sma.diff()  # SMA_t - SMA_{t-1}
+    close_sma_pct = (close - sma) / sma  # (Close_t - SMA_t) / SMA_t
+    volume_diff = df["Volume"].diff()  # Volume_t - Volume_{t-1}
+    hist_max = close.cummax()
+    hist_min = close.cummin()
+    historical_max_pct = close / hist_max - 1  # Close_t / max_{<=t} - 1
+    historical_min_pct = close / hist_min - 1  # Close_t / min_{<=t} - 1
+    rel_max = close.shift(1).rolling(window=50, min_periods=1).max()
+    rel_min = close.shift(1).rolling(window=50, min_periods=1).min()
+    relative_max_pct = close / rel_max - 1  # Close_t / max_{t-50:t-1} - 1
+    relative_min_pct = close / rel_min - 1  # Close_t / min_{t-50:t-1} - 1
 
     df["ATR"] = atr
     df["SMA"] = sma
-    df["log_return_close"] = log_return
+    df["log_return_close"] = log_return_close
+    df["log_return_high"] = log_return_high
+    df["log_return_low"] = log_return_low
+    df["candle_direction"] = candle_direction
+    df["ATR_PCT"] = atr_pct
+    df["SMA_gradient"] = sma_gradient
+    df["close_sma_pct"] = close_sma_pct
+    df["volume_diff"] = volume_diff
+    df["historical_max_pct"] = historical_max_pct
+    df["relative_max_pct"] = relative_max_pct
+    df["historical_min_pct"] = historical_min_pct
+    df["relative_min_pct"] = relative_min_pct
 
-    # 4) Drop rows with NaN from indicators / first log return
+    # 4) Drop rows with NaN from indicators/returns (warmup period)
     df = df.dropna()
 
-    features = df[["log_return_close", "ATR", "SMA", "Volume"]]
-    # Volume alone captures market activity without adding noise of returns
+    feature_cols = [
+        "log_return_close",
+        "log_return_high",
+        "log_return_low",
+        "candle_direction",
+        "ATR_PCT",
+        "SMA_gradient",
+        "close_sma_pct",
+        "volume_diff",
+        "historical_max_pct",
+        "relative_max_pct",
+        "historical_min_pct",
+        "relative_min_pct",
+    ]
+
+    features = df[feature_cols]
+    # volume_diff reflects changes in market activity without ratio noise
 
     # Logging shapes and ranges
     print(
@@ -121,7 +169,7 @@ class SingleAssetEnv:
         bid_close: np.ndarray,
         ask_close: np.ndarray,
         timestamps: pd.Index,
-        window_size: int = 10,
+        window_size: int = 5,
         fee_bps: float = 1.0,
         initial_capital: float = 10000.0,
         integer_shares: bool = False,
@@ -172,11 +220,13 @@ class SingleAssetEnv:
         if action == 2:  # Buy / all-in
             if self.cash > 0:
                 if self.integer_shares:
+                    # shares = floor(cash / ask)
                     shares_traded = np.floor(self.cash / ask)
                     cost = shares_traded * ask
                     fee_paid = cost * self.fee
                     self.cash -= cost + fee_paid
                 else:
+                    # shares = (cash * (1 - fee)) / ask
                     fee_paid = self.cash * self.fee
                     cash_to_spend = self.cash - fee_paid
                     shares_traded = cash_to_spend / ask
@@ -185,6 +235,7 @@ class SingleAssetEnv:
                 exec_price = ask
         elif action == 0:  # Sell / close
             if self.shares > 0:
+                # cash += shares * bid * (1 - fee)
                 gross = self.shares * bid
                 fee_paid = gross * self.fee
                 self.cash += gross - fee_paid
@@ -194,7 +245,9 @@ class SingleAssetEnv:
         # else: hold -> nothing changes
 
         position_after = 1 if self.shares > 0 else 0
+        # portfolio_value = cash + shares * BidClose
         self.portfolio_value = self.cash + self.shares * bid
+        # reward = Δ portfolio value
         reward = self.portfolio_value - prev_portfolio
 
         trade_info = {
@@ -239,8 +292,8 @@ class LinearModel:
         assert X.ndim == 2
         num_values = np.prod(Y.shape)
         Yhat = self.predict(X)
-        gW = 2 * X.T.dot(Yhat - Y) / num_values
-        gb = 2 * (Yhat - Y).sum(axis=0) / num_values
+        gW = 2 * X.T.dot(Yhat - Y) / num_values  # d/dW 1/N||Yhat-Y||^2
+        gb = 2 * (Yhat - Y).sum(axis=0) / num_values  # d/db 1/N||Yhat-Y||^2
         self.vW = momentum * self.vW - lr * gW
         self.vb = momentum * self.vb - lr * gb
         self.W += self.vW
@@ -279,18 +332,19 @@ class LinearQAgent:
 
     def act(self, state: np.ndarray) -> int:
         if np.random.rand() < self.epsilon:
-            return np.random.choice(self.n_action)
+            return np.random.choice(self.n_action)  # explore
         q = self.model.predict(state.reshape(1, -1))[0]
-        return int(np.argmax(q))
+        return int(np.argmax(q))  # exploit: argmax_a Q(s,a)
 
     def train(self, state, action, reward, next_state, done):
         state = state.reshape(1, -1)
         next_state = next_state.reshape(1, -1)
         target = self.model.predict(state)
         if done:
-            target[0, action] = reward
+            target[0, action] = reward  # Q(s,a) = r when terminal
         else:
             q_next = self.model.predict(next_state)[0]
+            # Q-learning target: r + gamma * max_a' Q(s',a')
             target[0, action] = reward + self.gamma * np.max(q_next)
         self.model.sgd(state, target, lr=self.lr)
         if self.epsilon > self.epsilon_min:
@@ -399,6 +453,7 @@ def run_test(df: pd.DataFrame, features: pd.DataFrame, args: Args):
     np.save("nas_rl_rewards/test.npy", np.array(portfolio_values))
 
     trades_df = pd.DataFrame(env.trades)
+    trades_df = trades_df[trades_df["shares_traded"] != 0]  # keep only actual trades
     trades_df.to_csv("nas_rl_trades/test_trades.csv", index=False)
 
     # Plot strategy vs index returns
@@ -428,8 +483,8 @@ def parse_args() -> Args:
     parser.add_argument("--sma", type=int, default=40)
     parser.add_argument("--fee_bps", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--window", type=int, default=10)
-    parser.add_argument("--episodes", type=int, default=100)
+    parser.add_argument("--window", type=int, default=5)
+    parser.add_argument("--episodes", type=int, default=2000)
     args = parser.parse_args()
     return Args(**vars(args))
 
