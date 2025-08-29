@@ -351,7 +351,7 @@ if __name__ == '__main__':
   portfolio_value = []
 
   if args.mode == 'test':
-    # then load the previous scaler
+    # then load the previous scaler #
     with open(f'{models_folder}/scaler.pkl', 'rb') as f:
       scaler = pickle.load(f)
 
