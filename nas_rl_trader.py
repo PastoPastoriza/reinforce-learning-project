@@ -8,6 +8,8 @@ matplotlib.use("Agg")  # Allow plotting without display
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from collections import deque
+import random
 from sklearn.preprocessing import StandardScaler
 
 
@@ -24,6 +26,14 @@ class Args:
 
     metric: str
     hold_bonus_bps: float
+    epsilon_min: float
+    epsilon_decay: float
+    epsilon: float
+    lr: float
+    l2: float
+    reward: str
+    patience: int
+    trade_penalty_bps: float
 
 
 
@@ -59,10 +69,11 @@ def compute_metric_from_portfolio_value(pv: np.ndarray, method: str = "end_value
         sigma = np.std(r) + 1e-12
         return float(mu / sigma * np.sqrt(24252))  # annualized Sharpe
     if method == "pnl_dd":
+        start = float(pv[0])
         end = float(pv[-1])
         peak = np.maximum.accumulate(pv)
         dd = np.max((peak - pv) / peak) if pv.size > 0 else 1.0
-        return float(end - 10000.0 * dd)
+        return float(end - start * dd)
     return float(pv[-1])
 
 
@@ -209,7 +220,8 @@ class SingleAssetEnv:
         integer_shares: bool = False,
 
         hold_bonus_bps: float = 0.0,
-
+        reward_mode: str = "return",
+        trade_penalty_bps: float = 0.0,
     ):
         self.features = features
         self.bid_close = bid_close
@@ -219,8 +231,10 @@ class SingleAssetEnv:
         self.fee = fee_bps / 10000.0
         self.initial_capital = initial_capital
         self.integer_shares = integer_shares
+        self.reward_mode = reward_mode
 
         self.hold_bonus_bps = hold_bonus_bps / 10000.0
+        self.trade_penalty = trade_penalty_bps / 10000.0
 
         self.n_features = features.shape[1]
         self.state_dim = window_size * self.n_features + 2  # + position, cash_norm
@@ -228,7 +242,7 @@ class SingleAssetEnv:
         self.reset()
 
     def reset(self):
-        self.current_step = self.window_size - 1
+        self.current_step = self.window_size
         self.cash = self.initial_capital
         self.shares = 0.0
         self.trades = []  # store logs for analysis
@@ -237,70 +251,78 @@ class SingleAssetEnv:
         return state
 
     def _get_state(self):
-        start = self.current_step - self.window_size + 1
-        window = self.features[start : self.current_step + 1]
+        start = self.current_step - self.window_size
+        window = self.features[start : self.current_step]
         state = window.flatten()
         # Extras give agent context about holding status and liquidity
-        position = 1.0 if self.shares > 0 else 0.0
+        if self.current_step == 0:
+            bid = self.bid_close[0]
+        else:
+            bid = self.bid_close[self.current_step - 1]
+        position_value = self.shares * bid
+        total_value = self.cash + position_value
+        position_frac = 0.0 if total_value == 0 else position_value / total_value
         cash_norm = self.cash / self.initial_capital
-        return np.concatenate([state, [position, cash_norm]])
+        return np.concatenate([state, [position_frac, cash_norm]])
 
     def step(self, action: int):
         bid = self.bid_close[self.current_step]
         ask = self.ask_close[self.current_step]
         timestamp = self.timestamps[self.current_step]
 
-        position_before = 1 if self.shares > 0 else 0
         prev_portfolio = self.cash + self.shares * bid
 
+        current_frac = 0.0 if prev_portfolio == 0 else (self.shares * bid) / prev_portfolio
+        target_frac = current_frac
+        if action == 1:  # BUY -> go full long
+            target_frac = 1.0
+        elif action == 2:  # SELL -> exit to cash
+            target_frac = 0.0
+
+        target_value = prev_portfolio * target_frac
+        target_shares = target_value / ask
+        if self.integer_shares:
+            target_shares = np.floor(target_shares)
+        delta_shares = target_shares - self.shares
+
         exec_price = np.nan
-        shares_traded = 0.0
         fee_paid = 0.0
+        if delta_shares > 0:  # buy
+            cost = delta_shares * ask
+            fee_paid = cost * self.fee
+            self.cash -= cost + fee_paid
+            self.shares += delta_shares
+            exec_price = ask
+        elif delta_shares < 0:  # sell
+            gross = -delta_shares * bid
+            fee_paid = gross * self.fee
+            self.cash += gross - fee_paid
+            self.shares += delta_shares
+            exec_price = bid
 
-        if action == 2:  # Buy / all-in
-            if self.cash > 0:
-                if self.integer_shares:
-                    # shares = floor(cash / ask)
-                    shares_traded = np.floor(self.cash / ask)
-                    cost = shares_traded * ask
-                    fee_paid = cost * self.fee
-                    self.cash -= cost + fee_paid
-                else:
-                    # shares = (cash * (1 - fee)) / ask
-                    fee_paid = self.cash * self.fee
-                    cash_to_spend = self.cash - fee_paid
-                    shares_traded = cash_to_spend / ask
-                    self.cash = 0.0
-                self.shares += shares_traded
-                exec_price = ask
-        elif action == 0:  # Sell / close
-            if self.shares > 0:
-                # cash += shares * bid * (1 - fee)
-                gross = self.shares * bid
-                fee_paid = gross * self.fee
-                self.cash += gross - fee_paid
-                shares_traded = -self.shares
-                self.shares = 0.0
-                exec_price = bid
-        # else: hold -> nothing changes
-
-        position_after = 1 if self.shares > 0 else 0
-        # portfolio_value = cash + shares * BidClose
         self.portfolio_value = self.cash + self.shares * bid
 
-        # reward = ΔV = V_t - V_{t-1}
-        reward = self.portfolio_value - prev_portfolio
-        if position_before > 0 and self.hold_bonus_bps > 0:
-            reward += self.hold_bonus_bps * prev_portfolio  # small incentive to stay invested
+        if self.reward_mode == "delta":
+            reward = self.portfolio_value - prev_portfolio
+        else:
+            reward = (self.portfolio_value - prev_portfolio) / max(prev_portfolio, 1e-9)
+        if (
+            self.shares > 0
+            and self.current_step > 0
+            and self.bid_close[self.current_step] > self.bid_close[self.current_step - 1]
+            and self.hold_bonus_bps > 0
+        ):
+            reward += self.hold_bonus_bps * prev_portfolio
 
+        if delta_shares != 0 and self.trade_penalty > 0:
+            reward -= self.trade_penalty * prev_portfolio
 
         trade_info = {
             "timestamp": timestamp,
-            "action": {0: "SELL", 1: "HOLD", 2: "BUY"}[action],
+            "action": {0: "HOLD", 1: "BUY", 2: "SELL"}[action],
             "exec_price": exec_price,
-            "position_before": position_before,
-            "position_after": position_after,
-            "shares_traded": shares_traded,
+            "position_after": target_frac,
+            "shares_traded": delta_shares,
             "fee_paid": fee_paid,
             "cash": self.cash,
             "portfolio_value": self.portfolio_value,
@@ -332,12 +354,20 @@ class LinearModel:
         assert X.ndim == 2
         return X.dot(self.W) + self.b
 
-    def sgd(self, X: np.ndarray, Y: np.ndarray, lr: float = 0.01, momentum: float = 0.9):
+    def sgd(
+        self,
+        X: np.ndarray,
+        Y: np.ndarray,
+        lr: float = 0.01,
+        momentum: float = 0.9,
+        l2: float = 0.0,
+    ):
         assert X.ndim == 2
         num_values = np.prod(Y.shape)
         Yhat = self.predict(X)
         gW = 2 * X.T.dot(Yhat - Y) / num_values  # d/dW 1/N||Yhat-Y||^2
         gb = 2 * (Yhat - Y).sum(axis=0) / num_values  # d/db 1/N||Yhat-Y||^2
+        gW += l2 * self.W
         self.vW = momentum * self.vW - lr * gW
         self.vb = momentum * self.vb - lr * gb
         self.W += self.vW
@@ -363,34 +393,63 @@ class LinearQAgent:
         epsilon_min: float = 0.01,
         epsilon_decay: float = 0.995,
         lr: float = 0.001,
+        l2: float = 0.0,
+        buffer_size: int = 50000,
+        batch_size: int = 64,
+        target_update: int = 100,
         seed: int = 0,
     ):
         np.random.seed(seed)
+        random.seed(seed)
         self.n_action = n_action
         self.gamma = gamma
         self.epsilon = epsilon
         self.epsilon_min = epsilon_min
         self.epsilon_decay = epsilon_decay
         self.lr = lr
+        self.l2 = l2
+        self.batch_size = batch_size
+        self.target_update = target_update
+        self.buffer: deque = deque(maxlen=buffer_size)
         self.model = LinearModel(state_dim, n_action)
+        self.target_model = LinearModel(state_dim, n_action)
+        self.update_target()
+        self.train_steps = 0
+
+    def update_target(self):
+        self.target_model.W = self.model.W.copy()
+        self.target_model.b = self.model.b.copy()
 
     def act(self, state: np.ndarray) -> int:
         if np.random.rand() < self.epsilon:
-            return np.random.choice(self.n_action)  # explore
+            return np.random.choice(self.n_action)
         q = self.model.predict(state.reshape(1, -1))[0]
-        return int(np.argmax(q))  # exploit: argmax_a Q(s,a)
+        return int(np.argmax(q))
 
-    def train(self, state, action, reward, next_state, done):
-        state = state.reshape(1, -1)
-        next_state = next_state.reshape(1, -1)
-        target = self.model.predict(state)
-        if done:
-            target[0, action] = reward  # Q(s,a) = r when terminal
-        else:
-            q_next = self.model.predict(next_state)[0]
-            # Q-learning target: r + gamma * max_a' Q(s',a')
-            target[0, action] = reward + self.gamma * np.max(q_next)
-        self.model.sgd(state, target, lr=self.lr)
+    def remember(self, state, action, reward, next_state, done):
+        self.buffer.append((state, action, reward, next_state, done))
+
+    def train(self):
+        if len(self.buffer) < self.batch_size:
+            return
+        batch = random.sample(self.buffer, self.batch_size)
+        states = np.vstack([b[0] for b in batch])
+        actions = np.array([b[1] for b in batch])
+        rewards = np.array([b[2] for b in batch])
+        next_states = np.vstack([b[3] for b in batch])
+        dones = np.array([b[4] for b in batch]).astype(float)
+
+        target = self.model.predict(states)
+        q_next = self.target_model.predict(next_states)
+        max_next = np.max(q_next, axis=1)
+        target[np.arange(self.batch_size), actions] = rewards + self.gamma * (1 - dones) * max_next
+        self.model.sgd(states, target, lr=self.lr, l2=self.l2)
+
+        self.train_steps += 1
+        if self.train_steps % self.target_update == 0:
+            self.update_target()
+
+    def decay_epsilon(self):
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
 
@@ -418,6 +477,8 @@ def build_env(df: pd.DataFrame, features: np.ndarray, args: Args) -> SingleAsset
         fee_bps=args.fee_bps,
 
         hold_bonus_bps=args.hold_bonus_bps,
+        reward_mode=args.reward,
+        trade_penalty_bps=args.trade_penalty_bps,
     )
 
 
@@ -430,7 +491,8 @@ def play_one_episode(agent: LinearQAgent, env: SingleAssetEnv, is_train: bool):
         action = agent.act(state)
         next_state, reward, done, info = env.step(action)
         if is_train:
-            agent.train(state, action, reward, next_state, done)
+            agent.remember(state, action, reward, next_state, done)
+            agent.train()
         state = next_state
         pv.append(info["portfolio_value"])
     return pv[-1], np.array(pv)
@@ -465,13 +527,21 @@ def run_train(df: pd.DataFrame, features: pd.DataFrame, args: Args):
 
     scaler = StandardScaler()
     scaler.fit(train_feat.values)
-    train_scaled = scaler.transform(train_feat.values)
+    train_scaled = np.clip(scaler.transform(train_feat.values), -5, 5)
 
-    val_scaled = scaler.transform(val_feat.values)
+    val_scaled = np.clip(scaler.transform(val_feat.values), -5, 5)
 
     env = build_env(train_df, train_scaled, args)
     val_env = build_env(val_df, val_scaled, args)
-    agent = LinearQAgent(env.state_dim, seed=args.seed)
+    agent = LinearQAgent(
+        env.state_dim,
+        epsilon=args.epsilon,
+        epsilon_min=args.epsilon_min,
+        epsilon_decay=args.epsilon_decay,
+        lr=args.lr,
+        l2=args.l2,
+        seed=args.seed,
+    )
 
     os.makedirs("nas_rl_models", exist_ok=True)
     maybe_make_dir("nas_rl_rewards")
@@ -480,17 +550,18 @@ def run_train(df: pd.DataFrame, features: pd.DataFrame, args: Args):
     last_weights_path = os.path.join("nas_rl_models", "weights_last.npz")
 
     train_end_values = []
+    no_improve = 0
     for ep in range(args.episodes):
         end_val, _ = play_one_episode(agent, env, is_train=True)
         train_end_values.append(end_val)
 
         epsilon_actual = agent.epsilon
         agent.epsilon = 0.0
-        val_end, pv_val = play_one_episode(agent, val_env, is_train=False)
+        _, pv_val = play_one_episode(agent, val_env, is_train=False)
         agent.epsilon = epsilon_actual
         metric = compute_metric_from_portfolio_value(pv_val, args.metric)
         print(
-            f"episode: {ep + 1}/{args.episodes}, train_end: {end_val:.2f}, val_{args.metric}: {metric:.2f}"
+            f"episode: {ep + 1}/{args.episodes}, eps: {agent.epsilon:.4f}, train_end: {end_val:.2f}, val_{args.metric}: {metric:.2f}"
         )
         if metric > best_val_score:
             best_val_score = metric
@@ -498,6 +569,14 @@ def run_train(df: pd.DataFrame, features: pd.DataFrame, args: Args):
             print(
                 f"[VAL] new best checkpoint -> {best_val_score:.2f} saved at {best_weights_path}"
             )
+            no_improve = 0
+        else:
+            no_improve += 1
+            if no_improve >= args.patience:
+                print("Early stopping due to no improvement")
+                break
+
+        agent.decay_epsilon()
 
     agent.save(last_weights_path)
     with open("nas_rl_models/scaler.pkl", "wb") as f:
@@ -512,10 +591,18 @@ def run_test(df: pd.DataFrame, features: pd.DataFrame, args: Args):
 
     with open("nas_rl_models/scaler.pkl", "rb") as f:
         scaler: StandardScaler = pickle.load(f)
-    test_scaled = scaler.transform(test_feat.values)
+    test_scaled = np.clip(scaler.transform(test_feat.values), -5, 5)
 
     env = build_env(test_df, test_scaled, args)
-    agent = LinearQAgent(env.state_dim, seed=args.seed)
+    agent = LinearQAgent(
+        env.state_dim,
+        epsilon=0.0,
+        epsilon_min=args.epsilon_min,
+        epsilon_decay=args.epsilon_decay,
+        lr=args.lr,
+        l2=args.l2,
+        seed=args.seed,
+    )
 
 
     best_path = os.path.join("nas_rl_models", "weights_best.npz")
@@ -576,12 +663,16 @@ def parse_args() -> Args:
     parser.add_argument("--window", type=int, default=5)
     parser.add_argument("--episodes", type=int, default=2000)
 
-    parser.add_argument(
-        "--metric",
-        choices=["end_value", "sharpe", "pnl_dd"],
-        default="end_value",
-    )
+    parser.add_argument("--metric", choices=["end_value", "sharpe", "pnl_dd"], default="pnl_dd")
     parser.add_argument("--hold_bonus_bps", type=float, default=0.0)
+    parser.add_argument("--epsilon", type=float, default=1.0)
+    parser.add_argument("--epsilon_min", type=float, default=0.01)
+    parser.add_argument("--epsilon_decay", type=float, default=0.99)
+    parser.add_argument("--lr", type=float, default=0.0003)
+    parser.add_argument("--l2", type=float, default=0.0)
+    parser.add_argument("--reward", choices=["delta", "return"], default="return")
+    parser.add_argument("--patience", type=int, default=50)
+    parser.add_argument("--trade_penalty_bps", type=float, default=5.0)
 
     args = parser.parse_args()
     return Args(**vars(args))
