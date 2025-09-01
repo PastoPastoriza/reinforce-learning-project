@@ -57,6 +57,8 @@ def compute_metric_from_portfolio_value(pv: np.ndarray, method: str = "end_value
         Array of portfolio values over time.
     method : str
         Metric to compute: ``end_value`` | ``sharpe`` | ``pnl_dd``.
+        ``pnl_dd`` scales the final value by ``1 / (1 + max_drawdown)``
+        to reward profits while moderating large drawdowns.
     """
     if pv.size == 0:
         return float("-inf")
@@ -70,11 +72,12 @@ def compute_metric_from_portfolio_value(pv: np.ndarray, method: str = "end_value
         sigma = np.std(r) + 1e-12
         return float(mu / sigma * np.sqrt(24252))  # annualized Sharpe
     if method == "pnl_dd":
-        start = float(pv[0])
         end = float(pv[-1])
         peak = np.maximum.accumulate(pv)
         dd = np.max((peak - pv) / peak) if pv.size > 0 else 1.0
-        return float(end - start * dd)
+        # Penalize drawdowns by scaling the final value.
+        # Metric grows when end-of-period PnL outweighs drawdown.
+        return float(end / (1.0 + dd))
     return float(pv[-1])
 
 
