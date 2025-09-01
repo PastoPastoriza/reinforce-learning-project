@@ -37,6 +37,7 @@ class Args:
 
 
 
+
 # -----------------------------------------------------------------------------
 # Utility functions
 # -----------------------------------------------------------------------------
@@ -222,6 +223,7 @@ class SingleAssetEnv:
         hold_bonus_bps: float = 0.0,
         reward_mode: str = "return",
         trade_penalty_bps: float = 0.0,
+
     ):
         self.features = features
         self.bid_close = bid_close
@@ -320,6 +322,7 @@ class SingleAssetEnv:
         trade_info = {
             "timestamp": timestamp,
             "action": {0: "HOLD", 1: "BUY", 2: "SELL"}[action],
+
             "exec_price": exec_price,
             "position_after": target_frac,
             "shares_traded": delta_shares,
@@ -560,9 +563,11 @@ def run_train(df: pd.DataFrame, features: pd.DataFrame, args: Args):
         _, pv_val = play_one_episode(agent, val_env, is_train=False)
         agent.epsilon = epsilon_actual
         metric = compute_metric_from_portfolio_value(pv_val, args.metric)
-        print(
-            f"episode: {ep + 1}/{args.episodes}, eps: {agent.epsilon:.4f}, train_end: {end_val:.2f}, val_{args.metric}: {metric:.2f}"
-        )
+        
+        if (ep + 1) % 10 == 0:
+            print(
+                f"episode: {ep + 1}/{args.episodes}, eps: {agent.epsilon:.4f}, train_end: {end_val:.2f}, val_{args.metric}: {metric:.2f}"
+            )
         if metric > best_val_score:
             best_val_score = metric
             agent.save(best_weights_path)
