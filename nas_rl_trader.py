@@ -21,8 +21,10 @@ class Args:
     seed: int
     window: int
     episodes: int
+
     metric: str
     hold_bonus_bps: float
+
 
 
 # -----------------------------------------------------------------------------
@@ -32,6 +34,7 @@ class Args:
 def maybe_make_dir(directory: str) -> None:
     if not os.path.exists(directory):
         os.makedirs(directory)
+
 
 
 def compute_metric_from_portfolio_value(pv: np.ndarray, method: str = "end_value") -> float:
@@ -204,7 +207,9 @@ class SingleAssetEnv:
         fee_bps: float = 1.0,
         initial_capital: float = 10000.0,
         integer_shares: bool = False,
+
         hold_bonus_bps: float = 0.0,
+
     ):
         self.features = features
         self.bid_close = bid_close
@@ -214,7 +219,9 @@ class SingleAssetEnv:
         self.fee = fee_bps / 10000.0
         self.initial_capital = initial_capital
         self.integer_shares = integer_shares
+
         self.hold_bonus_bps = hold_bonus_bps / 10000.0
+
         self.n_features = features.shape[1]
         self.state_dim = window_size * self.n_features + 2  # + position, cash_norm
 
@@ -280,10 +287,12 @@ class SingleAssetEnv:
         position_after = 1 if self.shares > 0 else 0
         # portfolio_value = cash + shares * BidClose
         self.portfolio_value = self.cash + self.shares * bid
+
         # reward = ΔV = V_t - V_{t-1}
         reward = self.portfolio_value - prev_portfolio
         if position_before > 0 and self.hold_bonus_bps > 0:
             reward += self.hold_bonus_bps * prev_portfolio  # small incentive to stay invested
+
 
         trade_info = {
             "timestamp": timestamp,
@@ -407,6 +416,7 @@ def build_env(df: pd.DataFrame, features: np.ndarray, args: Args) -> SingleAsset
         timestamps=df.index,
         window_size=args.window,
         fee_bps=args.fee_bps,
+
         hold_bonus_bps=args.hold_bonus_bps,
     )
 
@@ -452,9 +462,11 @@ def temporal_split(df: pd.DataFrame, features: pd.DataFrame):
 def run_train(df: pd.DataFrame, features: pd.DataFrame, args: Args):
     train_df, val_df, _, train_feat, val_feat, _ = temporal_split(df, features)
 
+
     scaler = StandardScaler()
     scaler.fit(train_feat.values)
     train_scaled = scaler.transform(train_feat.values)
+
     val_scaled = scaler.transform(val_feat.values)
 
     env = build_env(train_df, train_scaled, args)
@@ -497,12 +509,14 @@ def run_train(df: pd.DataFrame, features: pd.DataFrame, args: Args):
 def run_test(df: pd.DataFrame, features: pd.DataFrame, args: Args):
     _, _, test_df, _, _, test_feat = temporal_split(df, features)
 
+
     with open("nas_rl_models/scaler.pkl", "rb") as f:
         scaler: StandardScaler = pickle.load(f)
     test_scaled = scaler.transform(test_feat.values)
 
     env = build_env(test_df, test_scaled, args)
     agent = LinearQAgent(env.state_dim, seed=args.seed)
+
 
     best_path = os.path.join("nas_rl_models", "weights_best.npz")
     last_path = os.path.join("nas_rl_models", "weights_last.npz")
@@ -516,8 +530,10 @@ def run_test(df: pd.DataFrame, features: pd.DataFrame, args: Args):
         raise FileNotFoundError("No model weights found")
     agent.epsilon = 0.0
 
+
     maybe_make_dir("nas_rl_rewards")
     maybe_make_dir("nas_rl_trades")
+
 
     end_val, pv = play_one_episode(agent, env, is_train=False)
     np.save("nas_rl_rewards/test.npy", pv)
@@ -544,7 +560,9 @@ def run_test(df: pd.DataFrame, features: pd.DataFrame, args: Args):
     plt.tight_layout()
     plt.savefig("nas_rl_trades/test_returns.png")
 
+
     print(f"episode end value: {end_val:.2f}")
+
 
 
 def parse_args() -> Args:
@@ -557,12 +575,14 @@ def parse_args() -> Args:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--window", type=int, default=5)
     parser.add_argument("--episodes", type=int, default=2000)
+
     parser.add_argument(
         "--metric",
         choices=["end_value", "sharpe", "pnl_dd"],
         default="end_value",
     )
     parser.add_argument("--hold_bonus_bps", type=float, default=0.0)
+
     args = parser.parse_args()
     return Args(**vars(args))
 
