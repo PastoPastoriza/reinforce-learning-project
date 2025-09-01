@@ -542,9 +542,10 @@ def run_train(df: pd.DataFrame, features: pd.DataFrame, args: Args):
         _, pv_val = play_one_episode(agent, val_env, is_train=False)
         agent.epsilon = epsilon_actual
         metric = compute_metric_from_portfolio_value(pv_val, args.metric)
-        print(
-            f"episode: {ep + 1}/{args.episodes}, eps: {agent.epsilon:.4f}, train_end: {end_val:.2f}, val_{args.metric}: {metric:.2f}"
-        )
+        if (ep + 1) % 10 == 0:
+            print(
+                f"episode: {ep + 1}/{args.episodes}, eps: {agent.epsilon:.4f}, train_end: {end_val:.2f}, val_{args.metric}: {metric:.2f}"
+            )
         if metric > best_val_score:
             best_val_score = metric
             agent.save(best_weights_path)
