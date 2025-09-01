@@ -33,6 +33,8 @@ class Args:
     l2: float
     reward: str
     patience: int
+    trade_penalty_bps: float
+
 
 
 
@@ -220,6 +222,8 @@ class SingleAssetEnv:
 
         hold_bonus_bps: float = 0.0,
         reward_mode: str = "return",
+        trade_penalty_bps: float = 0.0,
+
     ):
         self.features = features
         self.bid_close = bid_close
@@ -232,6 +236,7 @@ class SingleAssetEnv:
         self.reward_mode = reward_mode
 
         self.hold_bonus_bps = hold_bonus_bps / 10000.0
+        self.trade_penalty = trade_penalty_bps / 10000.0
 
         self.n_features = features.shape[1]
         self.state_dim = window_size * self.n_features + 2  # + position, cash_norm
@@ -269,7 +274,13 @@ class SingleAssetEnv:
 
         prev_portfolio = self.cash + self.shares * bid
 
-        target_frac = {0: 0.0, 1: 0.5, 2: 1.0}[action]
+        current_frac = 0.0 if prev_portfolio == 0 else (self.shares * bid) / prev_portfolio
+        target_frac = current_frac
+        if action == 1:  # BUY -> go full long
+            target_frac = 1.0
+        elif action == 2:  # SELL -> exit to cash
+            target_frac = 0.0
+
         target_value = prev_portfolio * target_frac
         target_shares = target_value / ask
         if self.integer_shares:
@@ -297,12 +308,21 @@ class SingleAssetEnv:
             reward = self.portfolio_value - prev_portfolio
         else:
             reward = (self.portfolio_value - prev_portfolio) / max(prev_portfolio, 1e-9)
-        if target_frac > 0 and self.hold_bonus_bps > 0:
+        if (
+            self.shares > 0
+            and self.current_step > 0
+            and self.bid_close[self.current_step] > self.bid_close[self.current_step - 1]
+            and self.hold_bonus_bps > 0
+        ):
             reward += self.hold_bonus_bps * prev_portfolio
+
+        if delta_shares != 0 and self.trade_penalty > 0:
+            reward -= self.trade_penalty * prev_portfolio
 
         trade_info = {
             "timestamp": timestamp,
-            "action": {0: "FLAT", 1: "HALF", 2: "FULL"}[action],
+            "action": {0: "HOLD", 1: "BUY", 2: "SELL"}[action],
+
             "exec_price": exec_price,
             "position_after": target_frac,
             "shares_traded": delta_shares,
@@ -461,6 +481,7 @@ def build_env(df: pd.DataFrame, features: np.ndarray, args: Args) -> SingleAsset
 
         hold_bonus_bps=args.hold_bonus_bps,
         reward_mode=args.reward,
+        trade_penalty_bps=args.trade_penalty_bps,
     )
 
 
@@ -542,6 +563,7 @@ def run_train(df: pd.DataFrame, features: pd.DataFrame, args: Args):
         _, pv_val = play_one_episode(agent, val_env, is_train=False)
         agent.epsilon = epsilon_actual
         metric = compute_metric_from_portfolio_value(pv_val, args.metric)
+        
         if (ep + 1) % 10 == 0:
             print(
                 f"episode: {ep + 1}/{args.episodes}, eps: {agent.epsilon:.4f}, train_end: {end_val:.2f}, val_{args.metric}: {metric:.2f}"
@@ -655,6 +677,7 @@ def parse_args() -> Args:
     parser.add_argument("--l2", type=float, default=0.0)
     parser.add_argument("--reward", choices=["delta", "return"], default="return")
     parser.add_argument("--patience", type=int, default=50)
+    parser.add_argument("--trade_penalty_bps", type=float, default=5.0)
 
     args = parser.parse_args()
     return Args(**vars(args))
