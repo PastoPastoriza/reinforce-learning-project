@@ -34,6 +34,7 @@ class Args:
     reward: str
     patience: int
     trade_penalty_bps: float
+    holding_cost_bps: float
 
 
 
@@ -210,7 +211,24 @@ def load_and_process(csv_path: str, atr_period: int, sma_period: int):
 
 
 class SingleAssetEnv:
-    """Single asset trading environment with windowed state."""
+    """Single asset trading environment with windowed state.
+
+    Parameters
+    ----------
+    features : np.ndarray
+        Windowed feature matrix used as observations.
+    bid_close, ask_close : np.ndarray
+        Bid/ask close prices for calculating portfolio value and trade costs.
+    hold_bonus_bps : float, optional
+        Bonus in basis points applied when holding a long position and price
+        increases, encouraging buy‑and‑hold during uptrends.
+    trade_penalty_bps : float, optional
+        Cost in basis points per traded notional value, discouraging frequent
+        rebalancing.
+    holding_cost_bps : float, optional
+        Per‑step cost in basis points applied while a position remains open to
+        discourage lingering in the market when momentum fades.
+    """
 
     def __init__(
         self,
@@ -226,6 +244,7 @@ class SingleAssetEnv:
         hold_bonus_bps: float = 0.0,
         reward_mode: str = "return",
         trade_penalty_bps: float = 0.0,
+        holding_cost_bps: float = 0.0,
 
     ):
         self.features = features
@@ -240,6 +259,7 @@ class SingleAssetEnv:
 
         self.hold_bonus_bps = hold_bonus_bps / 10000.0
         self.trade_penalty = trade_penalty_bps / 10000.0
+        self.holding_cost = holding_cost_bps / 10000.0
 
         self.n_features = features.shape[1]
         self.state_dim = window_size * self.n_features + 2  # + position, cash_norm
@@ -320,7 +340,10 @@ class SingleAssetEnv:
             reward += self.hold_bonus_bps * prev_portfolio
 
         if delta_shares != 0 and self.trade_penalty > 0:
-            reward -= self.trade_penalty * prev_portfolio
+            reward -= self.trade_penalty * abs(delta_shares) * ask
+
+        if self.shares > 0 and self.holding_cost > 0:
+            reward -= self.holding_cost * prev_portfolio
 
         trade_info = {
             "timestamp": timestamp,
@@ -492,6 +515,7 @@ def build_env(df: pd.DataFrame, features: np.ndarray, args: Args) -> SingleAsset
         hold_bonus_bps=args.hold_bonus_bps,
         reward_mode=args.reward,
         trade_penalty_bps=args.trade_penalty_bps,
+        holding_cost_bps=args.holding_cost_bps,
     )
 
 
@@ -681,7 +705,7 @@ def parse_args() -> Args:
     parser.add_argument("--episodes", type=int, default=2000)
 
     parser.add_argument("--metric", choices=["end_value", "sharpe", "pnl_dd"], default="pnl_dd")
-    parser.add_argument("--hold_bonus_bps", type=float, default=0.0)
+    parser.add_argument("--hold_bonus_bps", type=float, default=2.0)
     parser.add_argument("--epsilon", type=float, default=1.0)
     parser.add_argument("--epsilon_min", type=float, default=0.01)
     parser.add_argument("--epsilon_decay", type=float, default=0.99)
@@ -689,7 +713,8 @@ def parse_args() -> Args:
     parser.add_argument("--l2", type=float, default=0.0)
     parser.add_argument("--reward", choices=["delta", "return"], default="return")
     parser.add_argument("--patience", type=int, default=50)
-    parser.add_argument("--trade_penalty_bps", type=float, default=5.0)
+    parser.add_argument("--trade_penalty_bps", type=float, default=10.0)
+    parser.add_argument("--holding_cost_bps", type=float, default=0.0)
 
     args = parser.parse_args()
     return Args(**vars(args))
