@@ -211,7 +211,24 @@ def load_and_process(csv_path: str, atr_period: int, sma_period: int):
 
 
 class SingleAssetEnv:
-    """Single asset trading environment with windowed state."""
+    """Single asset trading environment with windowed state.
+
+    Parameters
+    ----------
+    features : np.ndarray
+        Windowed feature matrix used as observations.
+    bid_close, ask_close : np.ndarray
+        Bid/ask close prices for calculating portfolio value and trade costs.
+    hold_bonus_bps : float, optional
+        Bonus in basis points applied when holding a long position and price
+        increases, encouraging buy‑and‑hold during uptrends.
+    trade_penalty_bps : float, optional
+        Cost in basis points per traded notional value, discouraging frequent
+        rebalancing.
+    holding_cost_bps : float, optional
+        Per‑step cost in basis points applied while a position remains open to
+        discourage lingering in the market when momentum fades.
+    """
 
     def __init__(
         self,
@@ -696,7 +713,6 @@ def parse_args() -> Args:
     parser.add_argument("--l2", type=float, default=0.0)
     parser.add_argument("--reward", choices=["delta", "return"], default="return")
     parser.add_argument("--patience", type=int, default=50)
-
     parser.add_argument("--trade_penalty_bps", type=float, default=10.0)
 
     parser.add_argument("--holding_cost_bps", type=float, default=0.0)
