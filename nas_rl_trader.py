@@ -401,14 +401,18 @@ class LinearQAgent:
         batch_size: int = 64,
         target_update: int = 100,
         seed: int = 0,
+        total_episodes: int = 1,
     ):
         np.random.seed(seed)
         random.seed(seed)
         self.n_action = n_action
         self.gamma = gamma
         self.epsilon = epsilon
+        self.epsilon_start = epsilon
+        self.epsilon_end = epsilon_min
         self.epsilon_min = epsilon_min
         self.epsilon_decay = epsilon_decay
+        self.total_episodes = total_episodes
         self.lr = lr
         self.l2 = l2
         self.batch_size = batch_size
@@ -452,9 +456,12 @@ class LinearQAgent:
         if self.train_steps % self.target_update == 0:
             self.update_target()
 
-    def decay_epsilon(self):
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
+    def decay_epsilon(self, ep: int):
+        self.epsilon = max(
+            self.epsilon_end,
+            self.epsilon_start
+            - (self.epsilon_start - self.epsilon_end) * ep / self.total_episodes,
+        )
 
     def save(self, path: str):
         self.model.save(path)
@@ -544,6 +551,7 @@ def run_train(df: pd.DataFrame, features: pd.DataFrame, args: Args):
         lr=args.lr,
         l2=args.l2,
         seed=args.seed,
+        total_episodes=args.episodes,
     )
 
     os.makedirs("nas_rl_models", exist_ok=True)
@@ -581,7 +589,7 @@ def run_train(df: pd.DataFrame, features: pd.DataFrame, args: Args):
                 print("Early stopping due to no improvement")
                 break
 
-        agent.decay_epsilon()
+        agent.decay_epsilon(ep)
 
     agent.save(last_weights_path)
     with open("nas_rl_models/scaler.pkl", "wb") as f:
@@ -607,6 +615,7 @@ def run_test(df: pd.DataFrame, features: pd.DataFrame, args: Args):
         lr=args.lr,
         l2=args.l2,
         seed=args.seed,
+        total_episodes=args.episodes,
     )
 
 
