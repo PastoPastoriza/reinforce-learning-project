@@ -22,6 +22,10 @@ class Args:
     window: int
     episodes: int
 
+    metric: str
+    hold_bonus_bps: float
+
+
 
 # -----------------------------------------------------------------------------
 # Utility functions
@@ -30,6 +34,36 @@ class Args:
 def maybe_make_dir(directory: str) -> None:
     if not os.path.exists(directory):
         os.makedirs(directory)
+
+
+
+def compute_metric_from_portfolio_value(pv: np.ndarray, method: str = "end_value") -> float:
+    """Compute validation metric from portfolio value series.
+
+    Parameters
+    ----------
+    pv : np.ndarray
+        Array of portfolio values over time.
+    method : str
+        Metric to compute: ``end_value`` | ``sharpe`` | ``pnl_dd``.
+    """
+    if pv.size == 0:
+        return float("-inf")
+    if method == "end_value":
+        return float(pv[-1])
+    if method == "sharpe":
+        r = np.diff(pv) / pv[:-1]
+        if r.size == 0:
+            return -1e9
+        mu = np.mean(r)
+        sigma = np.std(r) + 1e-12
+        return float(mu / sigma * np.sqrt(24252))  # annualized Sharpe
+    if method == "pnl_dd":
+        end = float(pv[-1])
+        peak = np.maximum.accumulate(pv)
+        dd = np.max((peak - pv) / peak) if pv.size > 0 else 1.0
+        return float(end - 10000.0 * dd)
+    return float(pv[-1])
 
 
 def load_and_process(csv_path: str, atr_period: int, sma_period: int):
@@ -173,6 +207,9 @@ class SingleAssetEnv:
         fee_bps: float = 1.0,
         initial_capital: float = 10000.0,
         integer_shares: bool = False,
+
+        hold_bonus_bps: float = 0.0,
+
     ):
         self.features = features
         self.bid_close = bid_close
@@ -182,6 +219,9 @@ class SingleAssetEnv:
         self.fee = fee_bps / 10000.0
         self.initial_capital = initial_capital
         self.integer_shares = integer_shares
+
+        self.hold_bonus_bps = hold_bonus_bps / 10000.0
+
         self.n_features = features.shape[1]
         self.state_dim = window_size * self.n_features + 2  # + position, cash_norm
 
@@ -247,8 +287,12 @@ class SingleAssetEnv:
         position_after = 1 if self.shares > 0 else 0
         # portfolio_value = cash + shares * BidClose
         self.portfolio_value = self.cash + self.shares * bid
-        # reward = Δ portfolio value
+
+        # reward = ΔV = V_t - V_{t-1}
         reward = self.portfolio_value - prev_portfolio
+        if position_before > 0 and self.hold_bonus_bps > 0:
+            reward += self.hold_bonus_bps * prev_portfolio  # small incentive to stay invested
+
 
         trade_info = {
             "timestamp": timestamp,
@@ -372,62 +416,99 @@ def build_env(df: pd.DataFrame, features: np.ndarray, args: Args) -> SingleAsset
         timestamps=df.index,
         window_size=args.window,
         fee_bps=args.fee_bps,
+
+        hold_bonus_bps=args.hold_bonus_bps,
     )
+
+
+def play_one_episode(agent: LinearQAgent, env: SingleAssetEnv, is_train: bool):
+    """Run a single episode and return end value and portfolio path."""
+    state = env.reset()
+    done = False
+    pv = []
+    while not done:
+        action = agent.act(state)
+        next_state, reward, done, info = env.step(action)
+        if is_train:
+            agent.train(state, action, reward, next_state, done)
+        state = next_state
+        pv.append(info["portfolio_value"])
+    return pv[-1], np.array(pv)
 
 
 def temporal_split(df: pd.DataFrame, features: pd.DataFrame):
-    train_mask = (df.index >= "2021-01-01") & (df.index <= "2023-12-31")
-    test_mask = df.index >= "2024-01-01"
+    train_mask = (df.index >= "2022-01-01") & (df.index <= "2023-12-31")
+    val_mask = (df.index >= "2024-01-01") & (df.index <= "2024-12-31")
+    test_mask = df.index >= "2025-01-01"
     train_df = df.loc[train_mask]
+    val_df = df.loc[val_mask]
     test_df = df.loc[test_mask]
     train_feat = features.loc[train_mask]
+    val_feat = features.loc[val_mask]
     test_feat = features.loc[test_mask]
 
     print(
-        f"Train -> shape: {train_df.shape}, range: {train_df.index.min()} to {train_df.index.max()}"
+        f"Train -> rows: {len(train_df)}, range: {train_df.index.min()} to {train_df.index.max()}"
     )
     print(
-        f"Test  -> shape: {test_df.shape}, range: {test_df.index.min()} to {test_df.index.max()}"
+        f"Val   -> rows: {len(val_df)}, range: {val_df.index.min()} to {val_df.index.max()}"
     )
-    return train_df, test_df, train_feat, test_feat
+    print(
+        f"Test  -> rows: {len(test_df)}, range: {test_df.index.min()} to {test_df.index.max()}"
+    )
+    return train_df, val_df, test_df, train_feat, val_feat, test_feat
 
 
 def run_train(df: pd.DataFrame, features: pd.DataFrame, args: Args):
-    train_df, _, train_feat, _ = temporal_split(df, features)
+    train_df, val_df, _, train_feat, val_feat, _ = temporal_split(df, features)
+
 
     scaler = StandardScaler()
     scaler.fit(train_feat.values)
     train_scaled = scaler.transform(train_feat.values)
 
+    val_scaled = scaler.transform(val_feat.values)
+
     env = build_env(train_df, train_scaled, args)
+    val_env = build_env(val_df, val_scaled, args)
     agent = LinearQAgent(env.state_dim, seed=args.seed)
 
-    maybe_make_dir("nas_rl_models")
+    os.makedirs("nas_rl_models", exist_ok=True)
     maybe_make_dir("nas_rl_rewards")
+    best_val_score = -float("inf")
+    best_weights_path = os.path.join("nas_rl_models", "weights_best.npz")
+    last_weights_path = os.path.join("nas_rl_models", "weights_last.npz")
 
-    portfolio_values = []
+    train_end_values = []
     for ep in range(args.episodes):
-        state = env.reset()
-        done = False
-        while not done:
-            action = agent.act(state)
-            next_state, reward, done, info = env.step(action)
-            agent.train(state, action, reward, next_state, done)
-            state = next_state
-        portfolio_values.append(info["portfolio_value"])
-        print(
-            f"episode: {ep + 1}/{args.episodes}, episode end value: {info['portfolio_value']:.2f}"
-        )
+        end_val, _ = play_one_episode(agent, env, is_train=True)
+        train_end_values.append(end_val)
 
-    agent.save("nas_rl_models/weights.npz")
+        epsilon_actual = agent.epsilon
+        agent.epsilon = 0.0
+        val_end, pv_val = play_one_episode(agent, val_env, is_train=False)
+        agent.epsilon = epsilon_actual
+        metric = compute_metric_from_portfolio_value(pv_val, args.metric)
+        print(
+            f"episode: {ep + 1}/{args.episodes}, train_end: {end_val:.2f}, val_{args.metric}: {metric:.2f}"
+        )
+        if metric > best_val_score:
+            best_val_score = metric
+            agent.save(best_weights_path)
+            print(
+                f"[VAL] new best checkpoint -> {best_val_score:.2f} saved at {best_weights_path}"
+            )
+
+    agent.save(last_weights_path)
     with open("nas_rl_models/scaler.pkl", "wb") as f:
         pickle.dump(scaler, f)
 
-    np.save("nas_rl_rewards/train.npy", np.array(portfolio_values))
+    np.save("nas_rl_rewards/train.npy", np.array(train_end_values))
 
 
 def run_test(df: pd.DataFrame, features: pd.DataFrame, args: Args):
-    _, test_df, _, test_feat = temporal_split(df, features)
+    _, _, test_df, _, _, test_feat = temporal_split(df, features)
+
 
     with open("nas_rl_models/scaler.pkl", "rb") as f:
         scaler: StandardScaler = pickle.load(f)
@@ -435,35 +516,43 @@ def run_test(df: pd.DataFrame, features: pd.DataFrame, args: Args):
 
     env = build_env(test_df, test_scaled, args)
     agent = LinearQAgent(env.state_dim, seed=args.seed)
-    agent.load("nas_rl_models/weights.npz")
-    agent.epsilon = 0.0  # deterministic policy
+
+
+    best_path = os.path.join("nas_rl_models", "weights_best.npz")
+    last_path = os.path.join("nas_rl_models", "weights_last.npz")
+    if os.path.exists(best_path):
+        agent.load(best_path)
+        print(f"Loaded best weights from {best_path}")
+    elif os.path.exists(last_path):
+        agent.load(last_path)
+        print(f"[WARN] best weights not found, using last weights from {last_path}")
+    else:
+        raise FileNotFoundError("No model weights found")
+    agent.epsilon = 0.0
+
 
     maybe_make_dir("nas_rl_rewards")
     maybe_make_dir("nas_rl_trades")
 
-    state = env.reset()
-    done = False
-    portfolio_values = []
-    while not done:
-        action = agent.act(state)
-        next_state, reward, done, info = env.step(action)
-        state = next_state
-        portfolio_values.append(info["portfolio_value"])
 
-    np.save("nas_rl_rewards/test.npy", np.array(portfolio_values))
+    end_val, pv = play_one_episode(agent, env, is_train=False)
+    np.save("nas_rl_rewards/test.npy", pv)
 
     trades_df = pd.DataFrame(env.trades)
-    trades_df = trades_df[trades_df["shares_traded"] != 0]  # keep only actual trades
-    trades_df.to_csv("nas_rl_trades/test_trades.csv", index=False)
+    trades_df[trades_df["shares_traded"] != 0].to_csv(
+        "nas_rl_trades/test_trades.csv", index=False
+    )
+    trades_df.to_csv("nas_rl_trades/test_actions_full.csv", index=False)
 
-    # Plot strategy vs index returns
-    dates = test_df.index[args.window - 1 : args.window - 1 + len(portfolio_values)]
-    nasdaq_prices = test_df["BidClose"].iloc[args.window - 1 : args.window - 1 + len(portfolio_values)]
-    nasdaq_ret = nasdaq_prices / nasdaq_prices.iloc[0] - 1
-    strat_ret = np.array(portfolio_values) / env.initial_capital - 1
+    dates = test_df.index[args.window - 1 : args.window - 1 + len(pv)]
+    nasdaq_prices = test_df["BidClose"].iloc[
+        args.window - 1 : args.window - 1 + len(pv)
+    ]
+    nas_ret = nasdaq_prices / nasdaq_prices.iloc[0] - 1
+    strat_ret = pv / env.initial_capital - 1
 
     plt.figure(figsize=(10, 5))
-    plt.plot(dates, nasdaq_ret, label="Nasdaq")
+    plt.plot(dates, nas_ret, label="Nasdaq")
     plt.plot(dates, strat_ret, label="Strategy")
     plt.legend()
     plt.xlabel("Date")
@@ -471,8 +560,9 @@ def run_test(df: pd.DataFrame, features: pd.DataFrame, args: Args):
     plt.tight_layout()
     plt.savefig("nas_rl_trades/test_returns.png")
 
-    if portfolio_values:
-        print(f"episode end value: {portfolio_values[-1]:.2f}")
+
+    print(f"episode end value: {end_val:.2f}")
+
 
 
 def parse_args() -> Args:
@@ -485,6 +575,14 @@ def parse_args() -> Args:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--window", type=int, default=5)
     parser.add_argument("--episodes", type=int, default=2000)
+
+    parser.add_argument(
+        "--metric",
+        choices=["end_value", "sharpe", "pnl_dd"],
+        default="end_value",
+    )
+    parser.add_argument("--hold_bonus_bps", type=float, default=0.0)
+
     args = parser.parse_args()
     return Args(**vars(args))
 
