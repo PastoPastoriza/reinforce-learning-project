@@ -129,6 +129,7 @@ def load_and_process(csv_path: str, atr_period: int, sma_period: int):
 
 def train(args):
     df, features = load_and_process(args.csv, args.atr, args.sma)
+
     price_all = df["BidClose"].astype(float).values
     feat_all = features.values.astype(float)
     split = int(len(price_all) * 0.75)
@@ -138,7 +139,9 @@ def train(args):
     std = feat.std(axis=0) + 1e-8
     feat = (feat - mean) / std
     n = len(price)
+
     print(f"Train/test split -> train:{n}, test:{len(price_all) - n}")
+    
     rng = np.random.default_rng(args.seed)
     d = feat.shape[1] + 1
     w = rng.normal(scale=0.001, size=(3, d))
@@ -235,6 +238,7 @@ def test(args):
     strat_rets = []
     bench_rets = []
     for t in range(1, n):
+
         s = np.concatenate([feat[t - 1], [float(pos)]])
         a = int(np.argmax(w @ s + b))
         p = price[t - 1]
@@ -261,6 +265,7 @@ def test(args):
         if traded:
             trades.append({
                 "timestamp": idx[t - 1],
+
                 "action": act,
                 "price": p,
                 "shares": shares,
