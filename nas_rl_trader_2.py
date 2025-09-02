@@ -129,62 +129,87 @@ def load_and_process(csv_path: str, atr_period: int, sma_period: int):
 
 def train(args):
     df, features = load_and_process(args.csv, args.atr, args.sma)
-    price = df["BidClose"].astype(float).values
-    feat = features.values.astype(float)
+
+    price_all = df["BidClose"].astype(float).values
+    feat_all = features.values.astype(float)
+    split = int(len(price_all) * 0.75)
+    price = price_all[:split]
+    feat = feat_all[:split]
     mean = feat.mean(axis=0)
     std = feat.std(axis=0) + 1e-8
     feat = (feat - mean) / std
     n = len(price)
+
+    print(f"Train/test split -> train:{n}, test:{len(price_all) - n}")
+    
     rng = np.random.default_rng(args.seed)
     d = feat.shape[1] + 1
     w = rng.normal(scale=0.001, size=(3, d))
     b = np.zeros(3)
-    cash = 1.0
-    shares = 0.0
-    pos = 0
-    pv = 1.0
-    peak = pv
-    dd_prev = 0.0
     gamma = 0.99
     lr = 0.0001
-    for t in range(1, n):
-        s = np.concatenate([feat[t-1], [float(pos)]])
-        eps = max(0.05, 1.0 - (t-1)/(n-1)*0.95)
-        if rng.random() < eps:
-            a = rng.integers(0, 3)
+    total_steps = max(1, (n - 1) * args.episodes)
+    step = 0
+    best_pv = -np.inf
+    best_w, best_b = w.copy(), b.copy()
+    wait = 0
+    for ep in range(1, args.episodes + 1):
+        cash = 1.0
+        shares = 0.0
+        pos = 0
+        pv = 1.0
+        peak = pv
+        dd_prev = 0.0
+        for t in range(1, n):
+            s = np.concatenate([feat[t - 1], [float(pos)]])
+            eps = max(0.05, 1.0 - step / (total_steps - 1) * 0.95)
+            step += 1
+            if rng.random() < eps:
+                a = rng.integers(0, 3)
+            else:
+                a = int(np.argmax(w @ s + b))
+            p = price[t - 1]
+            if a == 1 and pos == 0:
+                shares = (cash * (1 - args.tx_cost)) / p
+                cash = 0.0
+                pos = 1
+            elif a == 2 and pos == 1:
+                cash = shares * p * (1 - args.tx_cost)
+                shares = 0.0
+                pos = 0
+            pv_mid = cash + shares * p
+            p_next = price[t]
+            pv_next = cash + shares * p_next
+            strat_ret = pv_next / pv_mid - 1.0
+            bench_ret = p_next / p - 1.0
+            peak = max(peak, pv_next)
+            dd = 1 - pv_next / peak
+            dd_step = max(0.0, dd - dd_prev)
+            reward = args.adv_weight * (strat_ret - bench_ret) - args.dd_penalty * dd_step
+            s_next = np.concatenate([feat[t], [float(pos)]])
+            q_sa = w[a] @ s + b[a]
+            q_next = np.max(w @ s_next + b) if t < n - 1 else 0.0
+            target = reward + gamma * q_next * (t < n - 1)
+            grad = q_sa - target
+            w[a] -= lr * grad * s
+            b[a] -= lr * grad
+            pv = pv_next
+            dd_prev = dd
+        print(f"Episode {ep} end value: {pv:.3f}, epsilon: {eps:.2f}")
+        if pv > best_pv:
+            best_pv = pv
+            best_w = w.copy()
+            best_b = b.copy()
+            wait = 0
         else:
-            a = int(np.argmax(w @ s + b))
-        p = price[t-1]
-        if a == 1 and pos == 0:
-            shares = (cash * (1 - args.tx_cost)) / p
-            cash = 0.0
-            pos = 1
-        elif a == 2 and pos == 1:
-            cash = shares * p * (1 - args.tx_cost)
-            shares = 0.0
-            pos = 0
-        pv_mid = cash + shares * p
-        p_next = price[t]
-        pv_next = cash + shares * p_next
-        strat_ret = pv_next / pv_mid - 1.0
-        bench_ret = p_next / p - 1.0
-        peak = max(peak, pv_next)
-        dd = 1 - pv_next / peak
-        dd_step = max(0.0, dd - dd_prev)
-        reward = args.adv_weight * (strat_ret - bench_ret) - args.dd_penalty * dd_step
-        s_next = np.concatenate([feat[t], [float(pos)]])
-        q_sa = w[a] @ s + b[a]
-        q_next = np.max(w @ s_next + b) if t < n - 1 else 0.0
-        target = reward + gamma * q_next * (t < n - 1)
-        grad = q_sa - target
-        w[a] -= lr * grad * s
-        b[a] -= lr * grad
-        pv = pv_next
-        dd_prev = dd
+            wait += 1
+            if wait >= args.patience:
+                print("Early stopping")
+                break
     np.savez(
         "nas_rl_model_2.npz",
-        w=w,
-        b=b,
+        w=best_w,
+        b=best_b,
         mean=mean,
         std=std,
         feature_cols=features.columns.values,
@@ -193,12 +218,16 @@ def train(args):
 
 def test(args):
     df, features = load_and_process(args.csv, args.atr, args.sma)
-    price = df["BidClose"].astype(float).values
-    feat = features.values.astype(float)
+    price_all = df["BidClose"].astype(float).values
+    feat_all = features.values.astype(float)
     data = np.load("nas_rl_model_2.npz")
     mean = data["mean"]
     std = data["std"]
-    feat = (feat - mean) / std
+    feat_all = (feat_all - mean) / std
+    split = int(len(price_all) * 0.75)
+    price = price_all[split:]
+    feat = feat_all[split:]
+    idx = df.index[split:]
     n = len(price)
     w = data["w"]
     b = data["b"]
@@ -209,9 +238,10 @@ def test(args):
     strat_rets = []
     bench_rets = []
     for t in range(1, n):
-        s = np.concatenate([feat[t-1], [float(pos)]])
+
+        s = np.concatenate([feat[t - 1], [float(pos)]])
         a = int(np.argmax(w @ s + b))
-        p = price[t-1]
+        p = price[t - 1]
         traded = False
         if a == 1 and pos == 0:
             shares = (cash * (1 - args.tx_cost)) / p
@@ -234,7 +264,8 @@ def test(args):
         bench_rets.append(bench_ret)
         if traded:
             trades.append({
-                "timestamp": df.index[t-1],
+                "timestamp": idx[t - 1],
+
                 "action": act,
                 "price": p,
                 "shares": shares,
@@ -255,8 +286,8 @@ def test(args):
     strat_cum = np.cumprod(1 + np.array(strat_rets)) - 1
     bench_cum = np.cumprod(1 + np.array(bench_rets)) - 1
     plt.figure(figsize=(8, 4))
-    plt.plot(df.index[1:], strat_cum, label="Strategy")
-    plt.plot(df.index[1:], bench_cum, label="Buy&Hold NASDAQ")
+    plt.plot(idx[1:], strat_cum, label="Strategy")
+    plt.plot(idx[1:], bench_cum, label="Buy&Hold NASDAQ")
     plt.title("Strategy vs Buy&Hold NASDAQ")
     plt.xlabel("Time")
     plt.ylabel("Cumulative Return")
@@ -264,6 +295,15 @@ def test(args):
     plt.grid(True)
     plt.tight_layout()
     plt.savefig("test_returns.png")
+    pd.DataFrame(
+        {
+            "timestamp": idx[1:],
+            "strategy": strat_cum,
+            "benchmark": bench_cum,
+        }
+    ).to_csv("test_results.csv", index=False)
+    final_pv = cash + shares * price[-1]
+    print(f"Test end value: {final_pv:.3f}")
 
 
 def parse_args():
@@ -276,6 +316,8 @@ def parse_args():
     p.add_argument("--tx_cost", type=float, default=0.0025)
     p.add_argument("--dd_penalty", type=float, default=1.0)
     p.add_argument("--adv_weight", type=float, default=1.0)
+    p.add_argument("--episodes", type=int, default=10)
+    p.add_argument("--patience", type=int, default=5)
     return p.parse_args()
 
 
