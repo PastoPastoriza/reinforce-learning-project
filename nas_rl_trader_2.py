@@ -75,8 +75,8 @@ def load_and_process(csv_path: str, atr_period: int, sma_period: int):
     sma_gradient = sma.diff()  # SMA_t - SMA_{t-1}
     close_sma_pct = (close - sma) / sma  # (Close_t - SMA_t) / SMA_t
     volume_diff = df["Volume"].diff()  # Volume_t - Volume_{t-1}
-    hist_max = close.cummax()
-    hist_min = close.cummin()
+    hist_max = close.shift(1).rolling(window=1000000, min_periods=1).max()
+    hist_min = close.shift(1).rolling(window=1000000, min_periods=1).min()
     historical_max_pct = close / hist_max - 1  # Close_t / max_{<=t} - 1
     historical_min_pct = close / hist_min - 1  # Close_t / min_{<=t} - 1
     rel_max = close.shift(1).rolling(window=50, min_periods=1).max()
