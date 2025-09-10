@@ -12,106 +12,17 @@ import pickle
 from sklearn.preprocessing import StandardScaler
 
 
-def load_and_process(csv_path = "/Users/jeronimopastoriza/Documents/Reinforce Learning Project/NAS100-m1.csv", atr_period = 14, sma_period = 50):
-    # 1) Read CSV and adjust timestamps (UTC-3 -> UTC)
-    df = pd.read_csv(csv_path, parse_dates=["Date"])
-    df["Date"] = df["Date"] - pd.Timedelta(hours=3)
-    df = df.sort_values("Date").set_index("Date")
-
-    # 2) Resample to 1H per side with specified rules
-    agg = {
-        "BidOpen": "first",
-        "BidHigh": "max",
-        "BidLow": "min",
-        "BidClose": "last",
-        "AskOpen": "first",
-        "AskHigh": "max",
-        "AskLow": "min",
-        "AskClose": "last",
-        "Volume": "sum",
-    }
-    df = df.resample("1h").agg(agg).dropna()
-
-    # 3) Indicators on BID prices
-    high = df["BidHigh"]
-    low = df["BidLow"]
-    open_ = df["BidOpen"]
-    close = df["BidClose"]
-
-    # True range components -> ATR
-    prev_close = close.shift(1)
-    tr = pd.concat(
-        [
-            high - low,  # high-low
-            (high - prev_close).abs(),  # |high-prev_close|
-            (prev_close - low).abs(),  # |prev_close-low|
-        ],
-        axis=1,
-    ).max(axis=1)
-    atr = tr.rolling(window=atr_period).mean()
-
-    sma = close.rolling(window=sma_period).mean()
-
-    # --- Feature engineering -------------------------------------------------
-    log_return_close = np.log(close / close.shift(1))  # ln(C_t / C_{t-1})
-    log_return_high = np.log(high / high.shift(1))  # ln(H_t / H_{t-1})
-    log_return_low = np.log(low / low.shift(1))  # ln(L_t / L_{t-1})
-    candle_direction = (close > open_).astype(float)  # 1 if green else 0
-    atr_pct = atr / close  # ATR_t / Close_t
-    sma_gradient = sma.diff()  # SMA_t - SMA_{t-1}
-    close_sma_pct = (close - sma) / sma  # (Close_t - SMA_t) / SMA_t
-    volume_diff = df["Volume"].diff()  # Volume_t - Volume_{t-1}
-    hist_max = close.shift(1).rolling(window=1000000, min_periods=1).max()
-    hist_min = close.shift(1).rolling(window=1000000, min_periods=1).min()
-    historical_max_pct = close / hist_max - 1  # Close_t / max_{<=t} - 1
-    historical_min_pct = close / hist_min - 1  # Close_t / min_{<=t} - 1
-    rel_max = close.shift(1).rolling(window=50, min_periods=1).max()
-    rel_min = close.shift(1).rolling(window=50, min_periods=1).min()
-    relative_max_pct = close / rel_max - 1  # Close_t / max_{t-50:t-1} - 1
-    relative_min_pct = close / rel_min - 1  # Close_t / min_{t-50:t-1} - 1
-
-    df["ATR"] = atr
-    df["SMA"] = sma
-    df["log_return_close"] = log_return_close
-    df["log_return_high"] = log_return_high
-    df["log_return_low"] = log_return_low
-    df["candle_direction"] = candle_direction
-    df["ATR_PCT"] = atr_pct
-    df["SMA_gradient"] = sma_gradient
-    df["close_sma_pct"] = close_sma_pct
-    df["volume_diff"] = volume_diff
-    df["historical_max_pct"] = historical_max_pct
-    df["relative_max_pct"] = relative_max_pct
-    df["historical_min_pct"] = historical_min_pct
-    df["relative_min_pct"] = relative_min_pct
-
-    # 4) Drop rows with NaN from indicators/returns (warmup period)
-    df = df.dropna()
-
-    feature_cols = [
-        "log_return_close",
-        "log_return_high",
-        "log_return_low",
-        "candle_direction",
-        "ATR_PCT",
-        "SMA_gradient",
-        "close_sma_pct",
-        "volume_diff",
-        "historical_max_pct",
-        "relative_max_pct",
-        "historical_min_pct",
-        "relative_min_pct",
-    ]
-
-    features = df[feature_cols]
-    # volume_diff reflects changes in market activity without ratio noise
-
-    # Logging shapes and ranges
-    print(
-        f"Data processed -> shape: {df.shape}, range: {df.index.min()} to {df.index.max()}"
-    )
-
-    return df, features
+# Let's use AAPL (Apple), MSI (Motorola), SBUX (Starbucks)
+def get_data():
+  # returns a T x 3 list of stock prices
+  # each row is a different stock
+  # 0 = AAPL
+  # 1 = MSI
+  # 2 = SBUX
+  # Reemplazá la línea del read_csv por estas dos líneas:
+  data_path = os.path.join(os.path.dirname(__file__), 'aapl_msi_sbux.csv')
+  df = pd.read_csv(data_path)
+  return df.values
 
 
 
@@ -218,8 +129,7 @@ class MultiStockEnv:
   def __init__(self, data, initial_investment=20000):
     # data
     self.stock_price_history = data
-    self.n_step, n_features = self.stock_price_history.shape
-    self.n_stock = 1  # we only have 1 stock in this env
+    self.n_step, self.n_stock = self.stock_price_history.shape
 
     # instance attributes
     self.initial_investment = initial_investment
@@ -244,8 +154,7 @@ class MultiStockEnv:
     self.action_list = list(map(list, itertools.product([0, 1, 2], repeat=self.n_stock)))
 
     # calculate size of state
-    self.state_dim = self.n_features # x window
-    self.balance_state_dim = self.n_stock * 2 + 1
+    self.state_dim = self.n_stock * 2 + 1
 
     self.reset()
 
@@ -253,7 +162,7 @@ class MultiStockEnv:
   def reset(self):
     self.cur_step = 0
     self.stock_owned = np.zeros(self.n_stock)
-    self.stock_price = 0 #self.stock_price_history.iloc[self.cur_step]
+    self.stock_price = self.stock_price_history[self.cur_step]
     self.cash_in_hand = self.initial_investment
     return self._get_obs()
 
@@ -266,8 +175,7 @@ class MultiStockEnv:
 
     # update price, i.e. go to the next day
     self.cur_step += 1
-    # self.stock_price = self.stock_price_history.iloc[self.cur_step]
-    self.stock_return = self.stock_price_history["log_return_close"].iloc[self.cur_step]
+    self.stock_price = self.stock_price_history[self.cur_step]
 
     # perform the trade
     self._trade(action)
@@ -277,7 +185,6 @@ class MultiStockEnv:
 
     # reward is the increase in porfolio value
     reward = cur_val - prev_val
-    # reward = self.stock_price_history["log_return_close"].iloc[self.cur_step]
 
     # done if we have run out of data
     done = self.cur_step == self.n_step - 1
@@ -290,18 +197,16 @@ class MultiStockEnv:
 
 
   def _get_obs(self):
-    obs = np.empty(self.balance_state_dim)
+    obs = np.empty(self.state_dim)
     obs[:self.n_stock] = self.stock_owned
-    # obs[self.n_stock:2*self.n_stock] = self.stock_price
-    obs[self.n_stock:2*self.n_stock] = self.stock_return
+    obs[self.n_stock:2*self.n_stock] = self.stock_price
     obs[-1] = self.cash_in_hand
     return obs
     
 
 
   def _get_val(self):
-    # return self.stock_owned.dot(self.stock_price) + self.cash_in_hand
-    return self.stock_owned.dot(self.stock_return) + self.cash_in_hand
+    return self.stock_owned.dot(self.stock_price) + self.cash_in_hand
 
 
   def _trade(self, action):
@@ -329,11 +234,7 @@ class MultiStockEnv:
     if sell_index:
       # NOTE: to simplify the problem, when we sell, we will sell ALL shares of that stock
       for i in sell_index:
-        # self.cash_in_hand += self.stock_price[i] * self.stock_owned[i]
-        self.cash_in_hand += self.stock_return[i] * self.cash_in_hand[i]
-
-        #VOY A DEJAR ACA. ESTABA CAMBIANDO STOCK_PRICE POR STOCK_RETURN. PERO AL CALCULAR AL VENDER, NO TIENE SENTIDO. 
-        #TENGO QUE CALCULAR AL VENDER POR EL PRECIO, O POR VELA CON EL RETURN.
+        self.cash_in_hand += self.stock_price[i] * self.stock_owned[i]
         self.stock_owned[i] = 0
     if buy_index:
       # NOTE: when buying, we will loop through each stock we want to buy,
@@ -432,14 +333,13 @@ if __name__ == '__main__':
   maybe_make_dir(models_folder)
   maybe_make_dir(rewards_folder)
 
-  data, features = load_and_process()
-  n_timesteps, n_features = features.shape
-  # n_stocks = 1  # we only have 1 stock in this env
+  data = get_data()
+  n_timesteps, n_stocks = data.shape
 
   n_train = n_timesteps // 2
 
-  train_data = features[:n_train]
-  test_data = features[n_train:]
+  train_data = data[:n_train]
+  test_data = data[n_train:]
 
   env = MultiStockEnv(train_data, initial_investment)
   state_size = env.state_dim
@@ -460,7 +360,7 @@ if __name__ == '__main__':
 
     # make sure epsilon is not 1!
     # no need to run multiple episodes if epsilon = 0, it's deterministic
-    agent.epsilon = 0
+    agent.epsilon = 0.01
 
     # load trained weights
     agent.load(f'{models_folder}/linear.npz')
@@ -470,8 +370,7 @@ if __name__ == '__main__':
     t0 = datetime.now()
     val = play_one_episode(agent, env, args.mode)
     dt = datetime.now() - t0
-    if e % 10 == 0:
-      print(f"episode: {e + 1}/{num_episodes}, episode end value: {val:.2f}, duration: {dt}")
+    print(f"episode: {e + 1}/{num_episodes}, episode end value: {val:.2f}, duration: {dt}")
     portfolio_value.append(val) # append episode end portfolio value
 
   # save the weights when we are done
