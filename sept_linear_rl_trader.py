@@ -8,6 +8,7 @@ import argparse
 import re
 import os
 import pickle
+import sys
 
 from sklearn.preprocessing import StandardScaler
 
@@ -248,7 +249,7 @@ class MultiStockEnv:
 
     # calculate size of state
     # self.state_dim = self.n_features # x window
-    self.balance_state_dim = self.n_stock * 2 + 1
+    self.balance_state_dim = self.n_stock * 2 + 1 + 1 # +1 for balance, +1 for in_trade status
     self.state_dim = self.balance_state_dim
 
     self.reset()
@@ -302,7 +303,8 @@ class MultiStockEnv:
     # obs[self.n_stock:2*self.n_stock] = self.stock_price
     obs[self.n_stock:2*self.n_stock] = self.stock_return
     # obs[-1] = self.cash_in_hand
-    obs[-1] = self.balance
+    obs[-2] = self.balance
+    obs[-1] = self.in_trade
     return obs
     
 
@@ -333,13 +335,12 @@ class MultiStockEnv:
         sell_index.append(i)
       elif a == 2:
         buy_index.append(i)
-
       elif a == 1:
         hold_index.append(i)
 
     # sell any stocks we want to sell
     # then buy any stocks we want to buy
-    if sell_index:
+    if sell_index and self.in_trade:
       # NOTE: to simplify the problem, when we sell, we will sell ALL shares of that stock
       for i in sell_index:
         # self.cash_in_hand += self.stock_price[i] * self.stock_owned[i]
@@ -347,9 +348,9 @@ class MultiStockEnv:
 
         #VOY A DEJAR ACA. ESTABA CAMBIANDO STOCK_PRICE POR STOCK_RETURN. PERO AL CALCULAR AL VENDER, NO TIENE SENTIDO. 
         #TENGO QUE CALCULAR AL VENDER POR EL PRECIO, O POR VELA CON EL RETURN.
-        self.stock_owned[i] = 1
+        self.stock_owned[i] = 0
         self.in_trade = False
-    if buy_index:
+    if buy_index and (not self.in_trade):
       # NOTE: when buying, we will loop through each stock we want to buy,
       #       and buy one share at a time until we run out of cash
       # can_buy = True
@@ -383,7 +384,8 @@ class DQNAgent(object):
     self.gamma = 0.95  # discount rate
     self.epsilon = 1.0  # exploration rate
     self.epsilon_min = 0.01
-    self.epsilon_decay = 0.995
+    # self.epsilon_decay = 0.995
+    self.epsilon_decay = (self.epsilon_min / self.epsilon) ** (1 / n_timesteps*2)
     self.model = LinearModel(state_size, action_size)
 
   def act(self, state):
@@ -427,24 +429,99 @@ def play_one_episode(agent, env, is_train):
   state = scaler.transform([state])
   done = False
 
+
+  timestamps = []
+  actions = []
+  pvs = []
+
+
   while not done:
     action = agent.act(state)
     next_state, reward, done, info = env.step(action)
+    ts = env.stock_price_history.index[env.cur_step]
+    timestamps.append(ts)
+    actions.append(action)
+    pvs.append(float(info['cur_val']))
     next_state = scaler.transform([next_state])
     if is_train == 'train':
       agent.train(state, action, reward, next_state, done)
     state = next_state
 
-  return info['cur_val']
+  # return info['cur_val']
+  if env.in_trade:
+    timestamps.append(env.stock_price_history.index[env.cur_step])
+    actions.append(0) # sell
+    pvs.append(float(info['cur_val']))
+
+  return pvs[-1], {'timestamps': timestamps, 'actions': actions, 'pvs': pvs}
+
+
+
+
+
+def plot_and_export_test(history, env, out_plot='test_returns.png', out_csv='test_trades.csv'):
+
+# Buy-and-hold cumulative return from log returns (aligned to logged timestamps)
+  idx = pd.Index(history['timestamps'])
+  ret = env.stock_price_history['log_return_close'].reindex(idx).astype(float).values
+  # bh_curve = np.exp(np.cumsum(ret))
+  # if len(bh_curve) > 0:
+  #   bh_curve = bh_curve / bh_curve[0]
+  bh_ret_pct = (np.exp(np.cumsum(ret)) - 1.0) * 100.0
+
+  # Strategy PV normalized to 1
+  pvs = np.array(history['pvs'], dtype=float)
+  # strat_curve = pvs / pvs[0] if len(pvs) > 0 and pvs[0] != 0 else pvs
+  strat_ret_pct = (pvs / env.initial_investment - 1.0) * 100.0
+
+  # Human-readable actions
+  action_names = ['sell' if a == 0 else 'hold' if a == 1 else 'buy' for a in history['actions']]
+
+  # CSV with all steps (filter later to just buys/sells if you prefer)
+  trades_df = pd.DataFrame({
+  'timestamp': history['timestamps'],
+  'action': history['actions'],
+  'action_name': action_names,
+  'portfolio_value': pvs,
+  # 'strategy_cumret': strat_curve,
+  # 'bh_cumret': bh_curve,
+  'strategy_ret_pct': strat_ret_pct,
+  'bh_ret_pct': bh_ret_pct,
+  })
+  trades_df = trades_df[trades_df['action'] != 1].copy() # filter only buys/sells
+  trades_df.to_csv(out_csv, index=False)
+  print(f'Wrote trades CSV: {out_csv}')
+
+  # Plot and save
+  plt.figure(figsize=(10, 5))
+  plt.plot(history['timestamps'], strat_ret_pct, label='Strategy return (%)')
+  plt.plot(history['timestamps'], bh_ret_pct, label='Buy & Hold return (%)')
+  plt.title('Strategy vs Buy & Hold (Test)')
+  plt.xlabel('Time')
+  plt.ylabel('Return (%)')
+  plt.grid(True, alpha=0.3)
+  plt.legend()
+  plt.tight_layout()
+  plt.savefig(out_plot, dpi=150)
+  print(f'Saved plot: {out_plot}')
+  try:
+    plt.show()
+  except Exception:
+    pass
+
+
+
+
+
 
 
 
 if __name__ == '__main__':
 
   # config
-  models_folder = 'linear_rl_trader_models'
-  rewards_folder = 'linear_rl_trader_rewards'
-  num_episodes = 100
+  models_folder = 'sep_linear_rl_trader_models'
+  rewards_folder = 'sep_linear_rl_trader_rewards'
+  num_episodes = 2000
   batch_size = 32
   initial_investment = 20000
 
@@ -491,13 +568,37 @@ if __name__ == '__main__':
     agent.load(f'{models_folder}/linear.npz')
 
   # play the game num_episodes times
-  for e in range(num_episodes):
-    t0 = datetime.now()
-    val = play_one_episode(agent, env, args.mode)
-    dt = datetime.now() - t0
-    if e % 10 == 0:
-      print(f"episode: {e + 1}/{num_episodes}, episode end value: {val:.2f}, duration: {dt}")
-    portfolio_value.append(val) # append episode end portfolio value
+  if args.mode == 'train':
+    for e in range(num_episodes):
+      # t0 = datetime.now()
+      end_val, _ = play_one_episode(agent, env, args.mode)
+      # dt = datetime.now() - t0
+      if e % 100 == 0:
+        print(f"episode: {e + 1}/{num_episodes}, episode end value: {end_val:.2f}, epsilon: {agent.epsilon}")
+      portfolio_value.append(end_val) # append episode end portfolio value
+  else:
+    # val = play_one_episode(agent, env, args.mode)
+    # print(f"test episode end value: {val:.2f}")
+    # portfolio_value.append(val) # append episode end portfolio value
+    num_episodes = 1
+
+    end_val, test_history = play_one_episode(agent, env, args.mode)
+
+    plot_and_export_test(
+    test_history,
+    env,
+    out_plot=f'{rewards_folder}/test_returns.png',
+    out_csv=f'{rewards_folder}/test_trades.csv'
+    )
+
+    portfolio_value.append(end_val)
+    print(f'Test episode end value: {end_val:.2f}')
+    np.save(f'{rewards_folder}/{args.mode}.npy', portfolio_value)
+    sys.exit(0)
+
+
+
+
 
   # save the weights when we are done
   if args.mode == 'train':
