@@ -218,7 +218,7 @@ class MultiStockEnv:
   def __init__(self, data, initial_investment=20000):
     # data
     self.stock_price_history = data
-    self.n_step, n_features = self.stock_price_history.shape
+    self.n_step, self.n_features = self.stock_price_history.shape
     self.n_stock = 1  # we only have 1 stock in this env
 
     # instance attributes
@@ -226,7 +226,10 @@ class MultiStockEnv:
     self.cur_step = None
     self.stock_owned = None
     self.stock_price = None
-    self.cash_in_hand = None
+    # self.cash_in_hand = None
+    self.balance = np.nan
+    self.in_trade = False
+    self.stock_return = None
 
     self.action_space = np.arange(3**self.n_stock)
 
@@ -244,8 +247,9 @@ class MultiStockEnv:
     self.action_list = list(map(list, itertools.product([0, 1, 2], repeat=self.n_stock)))
 
     # calculate size of state
-    self.state_dim = self.n_features # x window
+    # self.state_dim = self.n_features # x window
     self.balance_state_dim = self.n_stock * 2 + 1
+    self.state_dim = self.balance_state_dim
 
     self.reset()
 
@@ -254,7 +258,9 @@ class MultiStockEnv:
     self.cur_step = 0
     self.stock_owned = np.zeros(self.n_stock)
     self.stock_price = 0 #self.stock_price_history.iloc[self.cur_step]
-    self.cash_in_hand = self.initial_investment
+    # self.cash_in_hand = self.initial_investment
+    self.balance = self.initial_investment
+    self.stock_return = 0 
     return self._get_obs()
 
 
@@ -262,7 +268,8 @@ class MultiStockEnv:
     assert action in self.action_space
 
     # get current value before performing the action
-    prev_val = self._get_val()
+    # prev_val = self._get_val()
+    prev_val = self.balance
 
     # update price, i.e. go to the next day
     self.cur_step += 1
@@ -273,7 +280,7 @@ class MultiStockEnv:
     self._trade(action)
 
     # get the new value after taking the action
-    cur_val = self._get_val()
+    cur_val = self.balance
 
     # reward is the increase in porfolio value
     reward = cur_val - prev_val
@@ -294,14 +301,16 @@ class MultiStockEnv:
     obs[:self.n_stock] = self.stock_owned
     # obs[self.n_stock:2*self.n_stock] = self.stock_price
     obs[self.n_stock:2*self.n_stock] = self.stock_return
-    obs[-1] = self.cash_in_hand
+    # obs[-1] = self.cash_in_hand
+    obs[-1] = self.balance
     return obs
     
 
 
-  def _get_val(self):
-    # return self.stock_owned.dot(self.stock_price) + self.cash_in_hand
-    return self.stock_owned.dot(self.stock_return) + self.cash_in_hand
+  # def _get_val(self):
+  #   # return self.stock_owned.dot(self.stock_price) + self.cash_in_hand
+  #   self.balance = self.balance * self.stock_return
+  #   return self.balance
 
 
   def _trade(self, action):
@@ -318,11 +327,15 @@ class MultiStockEnv:
     # determine which stocks to buy or sell
     sell_index = [] # stores index of stocks we want to sell
     buy_index = [] # stores index of stocks we want to buy
+    hold_index = [] # stores index of stocks we want to hold
     for i, a in enumerate(action_vec):
       if a == 0:
         sell_index.append(i)
       elif a == 2:
         buy_index.append(i)
+
+      elif a == 1:
+        hold_index.append(i)
 
     # sell any stocks we want to sell
     # then buy any stocks we want to buy
@@ -330,22 +343,34 @@ class MultiStockEnv:
       # NOTE: to simplify the problem, when we sell, we will sell ALL shares of that stock
       for i in sell_index:
         # self.cash_in_hand += self.stock_price[i] * self.stock_owned[i]
-        self.cash_in_hand += self.stock_return[i] * self.cash_in_hand[i]
+        self.balance *= np.exp(self.stock_return)
 
         #VOY A DEJAR ACA. ESTABA CAMBIANDO STOCK_PRICE POR STOCK_RETURN. PERO AL CALCULAR AL VENDER, NO TIENE SENTIDO. 
         #TENGO QUE CALCULAR AL VENDER POR EL PRECIO, O POR VELA CON EL RETURN.
-        self.stock_owned[i] = 0
+        self.stock_owned[i] = 1
+        self.in_trade = False
     if buy_index:
       # NOTE: when buying, we will loop through each stock we want to buy,
       #       and buy one share at a time until we run out of cash
-      can_buy = True
-      while can_buy:
-        for i in buy_index:
-          if self.cash_in_hand > self.stock_price[i]:
-            self.stock_owned[i] += 1 # buy one share
-            self.cash_in_hand -= self.stock_price[i]
-          else:
-            can_buy = False
+      # can_buy = True
+      # while can_buy:
+      for i in buy_index:
+        # if self.cash_in_hand > self.stock_price[i]:
+        # self.stock_owned[i] = 1 # buy one share
+        # self.cash_in_hand -= self.stock_price[i]
+        # self.balance = self.balance * self.stock_return[i] porque si compro en close, no tiene sentido actualizar el balance con el return
+        # else:
+        #   can_buy = False
+        self.in_trade = True
+    if hold_index:
+      for i in hold_index:
+        if self.in_trade:
+          self.balance *= np.exp(self.stock_return)
+          self.stock_owned[i] = 1
+        else:
+          self.balance = self.balance
+          self.stock_owned[i] = 0
+
 
 
 
@@ -382,7 +407,7 @@ class DQNAgent(object):
     target_full[0, action] = target
 
     # Run one training step
-    self.model.sgd(state, target_full)
+    self.model.sgd(state, target_full, learning_rate=1e-4)
 
     if self.epsilon > self.epsilon_min:
       self.epsilon *= self.epsilon_decay
@@ -433,7 +458,7 @@ if __name__ == '__main__':
   maybe_make_dir(rewards_folder)
 
   data, features = load_and_process()
-  n_timesteps, n_features = features.shape
+  n_timesteps, N_features = features.shape
   # n_stocks = 1  # we only have 1 stock in this env
 
   n_train = n_timesteps // 2
