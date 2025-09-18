@@ -31,7 +31,8 @@ def load_and_process(csv_path = "/Users/jeronimopastoriza/Documents/Reinforce Le
         "AskClose": "last",
         "Volume": "sum",
     }
-    df = df.resample("1h").agg(agg).dropna()
+    # df = df.resample("1h").agg(agg).dropna()
+    df = df.resample("1d").agg(agg).dropna()
 
     # 3) Indicators on BID prices
     high = df["BidHigh"]
@@ -62,8 +63,10 @@ def load_and_process(csv_path = "/Users/jeronimopastoriza/Documents/Reinforce Le
     sma_gradient = sma.diff()  # SMA_t - SMA_{t-1}
     close_sma_pct = (close - sma) / sma  # (Close_t - SMA_t) / SMA_t
     volume_diff = df["Volume"].diff()  # Volume_t - Volume_{t-1}
-    hist_max = close.shift(1).rolling(window=1000000, min_periods=1).max()
-    hist_min = close.shift(1).rolling(window=1000000, min_periods=1).min()
+    # hist_max = close.shift(1).rolling(window=1000000, min_periods=1).max()
+    # hist_min = close.shift(1).rolling(window=1000000, min_periods=1).min()
+    hist_max = close.shift(1).rolling(window=365, min_periods=1).max()
+    hist_min = close.shift(1).rolling(window=365, min_periods=1).min()
     historical_max_pct = close / hist_max - 1  # Close_t / max_{<=t} - 1
     historical_min_pct = close / hist_min - 1  # Close_t / min_{<=t} - 1
     rel_max = close.shift(1).rolling(window=50, min_periods=1).max()
@@ -216,8 +219,10 @@ class MultiStockEnv:
     - 1 = hold
     - 2 = buy
   """
-  def __init__(self, data, initial_investment=20000):
+  def __init__(self, data, no_use_data = None, initial_investment=10000):
     # data
+    if no_use_data is not None:
+      self.no_use_data = no_use_data
     self.stock_price_history = data
     self.n_step, self.n_features = self.stock_price_history.shape
     self.n_stock = 1  # we only have 1 stock in this env
@@ -276,6 +281,7 @@ class MultiStockEnv:
     self.cur_step += 1
     # self.stock_price = self.stock_price_history.iloc[self.cur_step]
     self.stock_return = self.stock_price_history["log_return_close"].iloc[self.cur_step]
+    # stock_price = self.stock_price_history["BidClose"].iloc[self.cur_step]
 
     # perform the trade
     self._trade(action)
@@ -464,9 +470,9 @@ def plot_and_export_test(history, env, out_plot='test_returns.png', out_csv='tes
 # Buy-and-hold cumulative return from log returns (aligned to logged timestamps)
   idx = pd.Index(history['timestamps'])
   ret = env.stock_price_history['log_return_close'].reindex(idx).astype(float).values
-  # bh_curve = np.exp(np.cumsum(ret))
-  # if len(bh_curve) > 0:
-  #   bh_curve = bh_curve / bh_curve[0]
+
+  stock_price = env.no_use_data['BidClose'].reindex(idx).astype(float).values
+
   bh_ret_pct = (np.exp(np.cumsum(ret)) - 1.0) * 100.0
 
   # Strategy PV normalized to 1
@@ -483,8 +489,7 @@ def plot_and_export_test(history, env, out_plot='test_returns.png', out_csv='tes
   'action': history['actions'],
   'action_name': action_names,
   'portfolio_value': pvs,
-  # 'strategy_cumret': strat_curve,
-  # 'bh_cumret': bh_curve,
+  'stock_price': stock_price,
   'strategy_ret_pct': strat_ret_pct,
   'bh_ret_pct': bh_ret_pct,
   })
@@ -521,9 +526,9 @@ if __name__ == '__main__':
   # config
   models_folder = 'sep_linear_rl_trader_models'
   rewards_folder = 'sep_linear_rl_trader_rewards'
-  num_episodes = 2000
+  num_episodes = 5000
   batch_size = 32
-  initial_investment = 20000
+  initial_investment = 10000
 
 
   parser = argparse.ArgumentParser()
@@ -534,7 +539,7 @@ if __name__ == '__main__':
   maybe_make_dir(models_folder)
   maybe_make_dir(rewards_folder)
 
-  data, features = load_and_process()
+  no_use_data, features = load_and_process()
   n_timesteps, N_features = features.shape
   # n_stocks = 1  # we only have 1 stock in this env
 
@@ -542,8 +547,9 @@ if __name__ == '__main__':
 
   train_data = features[:n_train]
   test_data = features[n_train:]
+  no_use_test_data = no_use_data[n_train:]
 
-  env = MultiStockEnv(train_data, initial_investment)
+  env = MultiStockEnv(train_data, None, initial_investment)
   state_size = env.state_dim
   action_size = len(env.action_space)
   agent = DQNAgent(state_size, action_size)
@@ -558,7 +564,7 @@ if __name__ == '__main__':
       scaler = pickle.load(f)
 
     # remake the env with test data
-    env = MultiStockEnv(test_data, initial_investment)
+    env = MultiStockEnv(test_data, no_use_test_data, initial_investment)
 
     # make sure epsilon is not 1!
     # no need to run multiple episodes if epsilon = 0, it's deterministic
